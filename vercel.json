@@ -1,0 +1,9 @@
+{
+  "cleanUrls": true,
+  "redirects": [
+    { "source": "/mock-exam", "destination": "/aws/clf-c02", "permanent": true },
+    { "source": "/practice-exam", "destination": "/aws/clf-c02", "permanent": true },
+    { "source": "/domain-practice", "destination": "/aws/clf-c02", "permanent": true },
+    { "source": "/aws", "destination": "/", "permanent": true }
+  ]
+}
