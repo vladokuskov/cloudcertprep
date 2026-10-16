@@ -1,6 +1,6 @@
 ﻿import { useState, useEffect, useRef, Fragment } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Flag, AlertCircle, LayoutGrid, Heart, ArrowLeft } from 'lucide-react'
+import { Flag, AlertCircle, LayoutGrid, Heart, ArrowLeft, Check, X, Clock, BookOpen } from 'lucide-react'
 import { Button } from '../components/Button'
 import { Card } from '../components/Card'
 import { Alert } from '../components/Alert'
@@ -39,6 +39,12 @@ import { findNextDomainAction } from '../lib/domainStats'
 
 type ExamScreen = 'start' | 'exam' | 'results' | 'review'
 
+// 'exam' is the real-format timed run. 'practice' uses the same exam-weighted
+// question set but is untimed and reveals the correct answer + explanation as
+// soon as each question is answered. Practice runs are never saved as exam
+// attempts (the score is not a fair exam signal once answers are visible).
+type ExamMode = 'exam' | 'practice'
+
 // Marker set when a guest leaves the RESULTS screen toward /login, so returning
 // via "Continue as guest" re-shows that result instead of a fresh start screen
 // (P1-6). sessionStorage survives the full reload that "Continue as guest" does.
@@ -75,11 +81,18 @@ function rebuildResultsFromPending(pending: PendingAttempt) {
 interface QuestionState {
   userAnswer: string | string[] | null
   flagged: boolean
+  /** Practice mode only: the answer is locked and graded on screen. */
+  revealed?: boolean
 }
 
 function isQuestionAnswered(state: QuestionState | undefined): boolean {
   if (!state?.userAnswer) return false
   return Array.isArray(state.userAnswer) ? state.userAnswer.length > 0 : state.userAnswer !== ''
+}
+
+function isStateCorrect(q: Question, state: QuestionState | undefined): boolean {
+  const type = getQuestionType(q)
+  return isAnswerCorrect(state?.userAnswer || (type === 'single' ? '' : []), correctAnswerFor(q), type)
 }
 
 function ExamQuestionGrid({
@@ -106,23 +119,27 @@ function ExamQuestionGrid({
         const isAnswered = isQuestionAnswered(state)
         const isFlagged = state?.flagged || false
         const isCurrent = idx === currentIndex
+        const graded = state?.revealed ? (isStateCorrect(questions[idx], state) ? 'correct' : 'incorrect') : null
         const stateLabel = [
           isCurrent ? 'current' : null,
-          isAnswered ? 'answered' : 'not answered',
+          graded ?? (isAnswered ? 'answered' : 'not answered'),
           isFlagged ? 'flagged for review' : null,
         ].filter(Boolean).join(', ')
         const ariaLabel = `Question ${idx + 1}, ${stateLabel}`
+        const fill = graded === 'correct'
+          ? 'bg-success/15 text-success hover:bg-success/25'
+          : graded === 'incorrect'
+            ? 'bg-danger/10 text-danger hover:bg-danger/20'
+            : isAnswered
+              ? 'bg-brand/30 text-text-primary hover:bg-brand/50'
+              : 'bg-bg-dark text-text-muted hover:bg-bg-card-hover'
         return (
           <button
             key={idx}
             onClick={() => onSelect(idx)}
             aria-label={ariaLabel}
             aria-current={isCurrent ? 'true' : undefined}
-            className={`relative ${cellSize} rounded text-sm font-medium transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-brand ${
-              isAnswered
-                ? 'bg-brand/30 text-text-primary hover:bg-brand/50'
-                : 'bg-bg-dark text-text-muted hover:bg-bg-card-hover'
-            }${isCurrent ? ' ring-2 ring-inset ring-brand' : ''}`}
+            className={`relative ${cellSize} rounded text-sm font-medium transition-colors focus:outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-brand ${fill}${isCurrent ? ' ring-2 ring-inset ring-brand' : ''}`}
           >
             {idx + 1}
             {isFlagged && (
@@ -143,6 +160,12 @@ export function MockExam() {
   const signOut = useSignOut()
   const cert = useCert()
   const [screen, setScreen] = useState<ExamScreen>('start')
+  // ?mode=practice deep-links straight to practice mode (Practice menu entry).
+  const [mode, setMode] = useState<ExamMode>(() =>
+    new URLSearchParams(location.search).get('mode') === 'practice' ? 'practice' : 'exam')
+  const isPractice = mode === 'practice'
+  // Practice mode: shown when "Check answer" is pressed on an incomplete answer.
+  const [checkWarning, setCheckWarning] = useState(false)
   const [questions, setQuestions] = useState<Question[]>([])
   const [currentIndex, setCurrentIndex] = useState(0)
   const [answers, setAnswers] = useState<Map<number, QuestionState>>(new Map())
@@ -201,7 +224,7 @@ export function MockExam() {
   const examMinutes = Math.round(cert.examTimeSeconds / 60)
   const pageTitle = screen === 'exam'
     ? `Question ${currentIndex + 1} of ${cert.examQuestionCount} · CloudCertPrep`
-    : screen === 'results' ? 'Exam results · CloudCertPrep'
+    : screen === 'results' ? (isPractice ? 'Practice results · CloudCertPrep' : 'Exam results · CloudCertPrep')
     : screen === 'review' ? 'Review exam · CloudCertPrep'
     : `${cert.shortName} Practice Exam · ${cert.examQuestionCount} Questions, ${examMinutes} Min, Free · CloudCertPrep`
   // Per-cert canonical so each cert's practice exam ranks for its own
@@ -407,6 +430,7 @@ export function MockExam() {
       setPendingExternalUrl(null)
       setSubmitError(null)
       setTooShortNotSaved(false)
+      setCheckWarning(false)
       submittingRef.current = false // re-arm the dup-submit guard for this fresh attempt
       setScreen('exam')
       setStartTime(Date.now())
@@ -415,9 +439,14 @@ export function MockExam() {
       // auto-submit on the next tick) and a retake after a manual submit would
       // inherit whatever time was left on the previous attempt.
       timer.reset()
-      timer.start()
-      document.body.dataset.examActive = 'true'
-      trackEvent('exam_started', { guest: !user })
+      if (isPractice) {
+        // Untimed, and like domain practice it does not lock the header/footer.
+        trackEvent('practice_started', { surface: 'practice_exam', guest: !user })
+      } else {
+        timer.start()
+        document.body.dataset.examActive = 'true'
+        trackEvent('exam_started', { guest: !user })
+      }
       window.scrollTo(0, 0)
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Failed to load questions'
@@ -439,20 +468,46 @@ export function MockExam() {
     // per-question detail for signed-in users already lives in Supabase. This is
     // the guest-inclusive engagement signal; `surface` splits it from practice.
     const wasUnanswered = !isQuestionAnswered(currentState)
+    if (currentState.revealed) return
 
     if (current.isMultiAnswer) {
       const currentAnswers = Array.isArray(currentState.userAnswer) ? currentState.userAnswer : []
       const newAnswers = toggleMultiAnswer(currentAnswers, answer, MAX_MULTI_ANSWER)
       setAnswers(prev => new Map(prev).set(currentIndex, { ...currentState, userAnswer: newAnswers }))
-      if (wasUnanswered && newAnswers.length > 0) {
+      setCheckWarning(false)
+      if (!isPractice && wasUnanswered && newAnswers.length > 0) {
         trackEvent('question_answered', { surface: 'exam', domain_id: current.domainId })
       }
+    } else if (isPractice) {
+      // Single-answer practice: the pick is final and graded immediately.
+      const next = { ...currentState, userAnswer: answer, revealed: true }
+      setAnswers(prev => new Map(prev).set(currentIndex, next))
+      trackEvent('question_answered', { surface: 'practice_exam', domain_id: current.domainId, is_correct: isStateCorrect(current, next) })
     } else {
       setAnswers(prev => new Map(prev).set(currentIndex, { ...currentState, userAnswer: answer }))
       if (wasUnanswered) {
         trackEvent('question_answered', { surface: 'exam', domain_id: current.domainId })
       }
     }
+  }
+
+  // Practice mode: grade a multi / ordering / matching answer once it is
+  // complete. Incomplete answers show a warning instead of grading a half-answer
+  // (same rule as domain practice).
+  function revealCurrent() {
+    const current = questions[currentIndex]
+    const state = answers.get(currentIndex) || { userAnswer: null, flagged: false }
+    const type = getQuestionType(current)
+    const selected = Array.isArray(state.userAnswer) ? state.userAnswer.length : 0
+    const leftCount = (Object.keys(current.options) as OptionKey[]).filter(k => current.options[k]).length
+    const required = type === 'multi'
+      ? (Array.isArray(current.answer) ? current.answer.length : MAX_MULTI_ANSWER)
+      : type === 'matching' ? leftCount : 1
+    if (selected < required) { setCheckWarning(true); return }
+    const next = { ...state, revealed: true }
+    setAnswers(prev => new Map(prev).set(currentIndex, next))
+    setCheckWarning(false)
+    trackEvent('question_answered', { surface: 'practice_exam', domain_id: current.domainId, is_correct: isStateCorrect(current, next) })
   }
 
   // Ordering / matching answers are not single-key clicks: the input controls
@@ -464,8 +519,10 @@ export function MockExam() {
     const current = questions[currentIndex]
     const currentState = answers.get(currentIndex) || { userAnswer: null, flagged: false }
     const wasUnanswered = !isQuestionAnswered(currentState)
+    if (currentState.revealed) return
     setAnswers(prev => new Map(prev).set(currentIndex, { ...currentState, userAnswer: value }))
-    if (wasUnanswered && value.length > 0) {
+    setCheckWarning(false)
+    if (!isPractice && wasUnanswered && value.length > 0) {
       trackEvent('question_answered', { surface: 'exam', domain_id: current.domainId })
     }
   }
@@ -477,18 +534,15 @@ export function MockExam() {
 
   function goToQuestion(index: number) {
     setCurrentIndex(index)
+    setCheckWarning(false)
   }
 
   function nextQuestion() {
-    if (currentIndex < questions.length - 1) {
-      setCurrentIndex(currentIndex + 1)
-    }
+    if (currentIndex < questions.length - 1) goToQuestion(currentIndex + 1)
   }
 
   function previousQuestion() {
-    if (currentIndex > 0) {
-      setCurrentIndex(currentIndex - 1)
-    }
+    if (currentIndex > 0) goToQuestion(currentIndex - 1)
   }
 
   async function handleSubmitExam() {
@@ -510,7 +564,9 @@ export function MockExam() {
     const results = questions.map((q, idx) => {
       const state = answers.get(idx)
       const type = getQuestionType(q)
-      const userAnswer = state?.userAnswer || (type === 'single' ? '' : [])
+      const empty = type === 'single' ? '' : []
+      // Practice mode grades only checked answers (matches the on-screen tally).
+      const userAnswer = (isPractice && !state?.revealed) ? empty : (state?.userAnswer || empty)
       const correctAnswer = correctAnswerFor(q)
       const correct = isAnswerCorrect(userAnswer, correctAnswer, type)
 
@@ -542,8 +598,36 @@ export function MockExam() {
     }
 
     try {
-      // Only save to database if user is logged in AND exam took at least 60 seconds
-      if (!isGuest && user && !isTooShort) {
+      if (isPractice) {
+        // Practice runs are not exam attempts: nothing goes to exam_attempts or
+        // the guest pending-attempt snapshot. Signed-in users still get the
+        // graded questions recorded the same way domain practice records them
+        // (attempt_id null), so spaced repetition and mastery benefit.
+        if (user) {
+          const graded = results.filter((_, idx) => answers.get(idx)?.revealed)
+          if (graded.length > 0) {
+            const supabase = await getSupabase()
+            const { error: questionsError } = await supabase
+              .from('attempt_questions')
+              .insert(graded.map(r => ({
+                attempt_id: null,
+                user_id: user.id,
+                question_id: r.questionId,
+                user_answer: r.originalUserAnswer,
+                correct_answer: r.originalCorrectAnswer,
+                is_correct: r.isCorrect,
+                was_flagged: r.wasFlagged,
+                domain_id: r.domainId,
+                cert_code: cert.code,
+              })))
+            if (questionsError) throw questionsError
+            for (const domainId of new Set(graded.map(r => r.domainId))) {
+              await updateDomainProgress(user.id, domainId, cert.code)
+            }
+          }
+        }
+      } else if (!isGuest && user && !isTooShort) {
+        // Only save to database if user is logged in AND exam took at least 60 seconds
         const userId = user.id
         const supabase = await getSupabase()
         const { data: attemptData, error: attemptError } = await supabase
@@ -633,7 +717,9 @@ export function MockExam() {
       }
     } catch (error: unknown) {
       logError('MockExam.submitExam', error)
-      setSubmitError('Your results could not be saved. You can still review your answers.')
+      setSubmitError(isPractice
+        ? 'Your practice answers could not be saved to your progress. You can still review them below.'
+        : 'Your results could not be saved. You can still review your answers.')
     }
 
     // Always show results even if save failed
@@ -651,7 +737,11 @@ export function MockExam() {
     setScreen('results')
     delete document.body.dataset.examActive
     window.scrollTo(0, 0)
-    trackEvent('exam_completed', { passed, scaled_score: scaledScore, score_percent: Math.round(percentScore), guest: isGuest })
+    if (isPractice) {
+      trackEvent('practice_completed', { surface: 'practice_exam', correct: correctCount, total: questions.length, guest: isGuest })
+    } else {
+      trackEvent('exam_completed', { passed, scaled_score: scaledScore, score_percent: Math.round(percentScore), guest: isGuest })
+    }
     setLoading(false)
   }
 
@@ -660,6 +750,14 @@ export function MockExam() {
   const currentType = currentQuestion ? getQuestionType(currentQuestion) : 'single'
   const answeredCount = Array.from(answers.values()).filter(isQuestionAnswered).length
   const flaggedCount = Array.from(answers.values()).filter(s => s.flagged).length
+  const currentRevealed = !!currentState?.revealed
+  const currentCorrect = currentRevealed && isStateCorrect(currentQuestion, currentState)
+  const revealedCount = Array.from(answers.values()).filter(s => s.revealed).length
+  // In practice mode only checked answers count; an unchecked pick is ungraded.
+  const doneCount = isPractice ? revealedCount : answeredCount
+  const practiceCorrectCount = isPractice
+    ? questions.filter((q, idx) => answers.get(idx)?.revealed && isStateCorrect(q, answers.get(idx))).length
+    : 0
 
   // Guest-save loader, hoisted ABOVE the screen switch (hardening F3). The
   // arm effect is deliberately screen-agnostic (start OR results), but the
@@ -683,7 +781,43 @@ export function MockExam() {
         <div className="max-w-2xl mx-auto">
           <Card padding="lg">
             <h1 className="text-2xl md:text-3xl font-semibold text-text-primary mb-3 md:mb-4">{cert.shortName} Practice Exam</h1>
-            <p className="text-sm md:text-base text-text-muted mb-6 md:mb-8">{cert.examQuestionCount} questions, {Math.round(cert.examTimeSeconds / 60)} minutes. No answer feedback during exam.</p>
+            <p className="text-sm md:text-base text-text-muted mb-6 md:mb-8">
+              {isPractice
+                ? `${cert.examQuestionCount} questions, no timer. The correct answer and explanation appear as soon as you answer.`
+                : `${cert.examQuestionCount} questions, ${Math.round(cert.examTimeSeconds / 60)} minutes. No answer feedback during exam.`}
+            </p>
+
+            <fieldset className="mb-6 md:mb-8">
+              <legend className="text-sm font-medium text-text-primary mb-2">Mode</legend>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {([
+                  { value: 'exam', label: 'Exam mode', desc: 'Timed, scored, answers at the end', Icon: Clock },
+                  { value: 'practice', label: 'Practice mode', desc: 'Untimed, see the answer right away', Icon: BookOpen },
+                ] as const).map(({ value, label, desc, Icon }) => (
+                  <label
+                    key={value}
+                    className={`flex items-start gap-3 cursor-pointer rounded-xl border p-3 md:p-4 transition-colors has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-brand ${
+                      mode === value ? 'border-brand bg-brand/10' : 'border-text-muted/25 hover:border-text-muted/50'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="exam-mode"
+                      value={value}
+                      checked={mode === value}
+                      onChange={() => setMode(value)}
+                      disabled={loading}
+                      className="sr-only"
+                    />
+                    <Icon className={`w-5 h-5 mt-0.5 shrink-0 ${mode === value ? 'text-brand' : 'text-text-muted'}`} aria-hidden="true" />
+                    <span className="min-w-0">
+                      <span className="block text-sm md:text-base font-medium text-text-primary">{label}</span>
+                      <span className="block text-xs md:text-sm text-text-muted">{desc}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
 
             <div className="bg-bg-dark rounded-xl p-4 md:p-6 mb-6 md:mb-8">
               <h2 className="text-lg md:text-xl font-semibold text-text-primary mb-3 md:mb-4">Domain breakdown</h2>
@@ -728,12 +862,21 @@ export function MockExam() {
               })()}
             </div>
 
-            <Alert tone="warning" className="mb-6 md:mb-8">
-              <div className="flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 md:w-5 md:h-5 text-warning flex-shrink-0" />
-                <p className="text-sm md:text-base text-warning font-medium">Once started, the timer cannot be paused</p>
-              </div>
-            </Alert>
+            {isPractice ? (
+              <Alert tone="info" className="mb-6 md:mb-8">
+                <p className="text-sm md:text-base text-text-muted">
+                  Practice runs are not saved as exam attempts and do not count toward your exam history or community stats.
+                  {user ? ' Your answers still feed your domain mastery and spaced repetition.' : ''}
+                </p>
+              </Alert>
+            ) : (
+              <Alert tone="warning" className="mb-6 md:mb-8">
+                <div className="flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 md:w-5 md:h-5 text-warning flex-shrink-0" />
+                  <p className="text-sm md:text-base text-warning font-medium">Once started, the timer cannot be paused</p>
+                </div>
+              </Alert>
+            )}
 
             {loadError && (
               <Alert tone="danger" className="mb-4 md:mb-6 flex items-start gap-3">
@@ -764,7 +907,7 @@ export function MockExam() {
                 loading={loading}
                 loadingText="Loading questions..."
               >
-                Start exam
+                {isPractice ? 'Start practice' : 'Start exam'}
               </Button>
             </div>
           </Card>
@@ -781,7 +924,7 @@ export function MockExam() {
               `?code=` exchange window, when `user` is still null (hardening
               F5; CertDashboardIsland/_DomainPractice already do this). A real
               guest resolves loading=false synchronously, so no pop for them. */}
-          {!user && !authLoading && (
+          {!user && !authLoading && !isPractice && (
             <div className="mt-4 md:mt-6">
               <UnlockCTA
                 onSignIn={() => goToLogin(navigate, location)}
@@ -819,7 +962,14 @@ export function MockExam() {
               pre-signup share is pure top-of-funnel, but the quiet pill styling
               keeps it secondary to UnlockCTA. Score data never rides in the
               shared URL. (Growth Build 1, phase 1) */}
-          {results!.passed && (
+          {isPractice && (
+            <Alert tone="info">
+              <p className="text-sm text-text-muted">
+                <span className="font-semibold text-text-primary">Practice mode:</span> answers were visible as you went, so this score is a rough guide only and is not saved as an exam attempt.
+              </p>
+            </Alert>
+          )}
+          {results!.passed && !isPractice && (
             <div className="flex justify-end">
               <ShareResultButton
                 text={buildPassShareText({
@@ -895,7 +1045,7 @@ export function MockExam() {
               user is not a guest; without the arm this flashes "Sign in to
               save" for the whole exchange window (hardening F5, part of F3's
               flash). */}
-          {!user && !authLoading && (
+          {!user && !authLoading && !isPractice && (
             <UnlockCTA
               onSignIn={() => {
                 // Bind the stored snapshot to THIS save action: flushPendingAttempt
@@ -974,7 +1124,7 @@ export function MockExam() {
                 variant="secondary"
                 className="flex-1"
               >
-                Retake exam
+                {isPractice ? 'Practice again' : 'Retake exam'}
               </Button>
             </div>
 
@@ -1013,7 +1163,7 @@ export function MockExam() {
         {/* Visually-hidden page heading so the active exam's outline starts at
             h1 (the exam) -> h2 (the question) instead of opening on an orphan h2.
             Screen-reader only; no visual change. */}
-        <h1 className="sr-only">{cert.shortName} Practice Exam</h1>
+        <h1 className="sr-only">{cert.shortName} {isPractice ? 'Practice Mode' : 'Practice Exam'}</h1>
         {/* In-page exam toolbar: slim, neutral (NOT a second orange gradient),
             so it reads as a subordinate toolbar under the site header rather
             than a second heavy header bar. Sticks to the top while scrolling.
@@ -1030,17 +1180,26 @@ export function MockExam() {
               </span>
             </div>
             <div className="flex items-center gap-3 md:gap-4">
-              <div
-                aria-hidden="true"
-                className={`text-lg md:text-xl font-mono font-bold tabular-nums ${
-                  timer.seconds < TIMER_PULSE_THRESHOLD ? 'text-warning animate-pulse' : 'text-text-primary'
-                }`}
-              >
-                {formatTime(timer.seconds)}
-              </div>
-              <TimerAnnouncer seconds={timer.seconds} />
+              {isPractice ? (
+                <span className="font-mono text-sm md:text-base tabular-nums text-text-primary whitespace-nowrap">
+                  <span className="text-success font-semibold">{practiceCorrectCount}</span>
+                  <span className="text-text-muted">/{revealedCount} correct</span>
+                </span>
+              ) : (
+                <>
+                  <div
+                    aria-hidden="true"
+                    className={`text-lg md:text-xl font-mono font-bold tabular-nums ${
+                      timer.seconds < TIMER_PULSE_THRESHOLD ? 'text-warning animate-pulse' : 'text-text-primary'
+                    }`}
+                  >
+                    {formatTime(timer.seconds)}
+                  </div>
+                  <TimerAnnouncer seconds={timer.seconds} />
+                </>
+              )}
               <Button onClick={() => setShowEndModal(true)} variant="secondary" size="sm">
-                Submit exam
+                {isPractice ? 'Finish' : 'Submit exam'}
               </Button>
             </div>
           </div>
@@ -1098,17 +1257,19 @@ export function MockExam() {
               <div className="space-y-2.5 md:space-y-3 mb-4">
                 {currentType === 'ordering' ? (
                   <OrderingInput
-                    mode="input"
+                    mode={currentRevealed ? 'result' : 'input'}
                     options={currentQuestion.options}
                     value={Array.isArray(currentState?.userAnswer) ? currentState.userAnswer : null}
+                    correctOrder={currentRevealed ? currentQuestion.correctOrder : undefined}
                     onChange={setCurrentAnswer}
                   />
                 ) : currentType === 'matching' ? (
                   <MatchingInput
-                    mode="input"
+                    mode={currentRevealed ? 'result' : 'input'}
                     options={currentQuestion.options}
                     targets={currentQuestion.targets ?? {}}
                     value={Array.isArray(currentState?.userAnswer) ? currentState.userAnswer : null}
+                    correctMatches={currentRevealed ? currentQuestion.correctMatches : undefined}
                     onChange={setCurrentAnswer}
                   />
                 ) : (
@@ -1121,14 +1282,20 @@ export function MockExam() {
                     const currentSelections = currentQuestion.isMultiAnswer && Array.isArray(currentState?.userAnswer)
                       ? currentState.userAnswer.length
                       : 0
-                    const isDisabled = currentQuestion.isMultiAnswer && !isSelected && currentSelections >= requiredCount
+                    const isDisabled = currentRevealed || (currentQuestion.isMultiAnswer && !isSelected && currentSelections >= requiredCount)
+
+                    let state: 'default' | 'selected' | 'correct' | 'wrong' = isSelected ? 'selected' : 'default'
+                    if (currentRevealed) {
+                      const correctKeys = Array.isArray(currentQuestion.answer) ? currentQuestion.answer : [currentQuestion.answer]
+                      state = correctKeys.includes(key) ? 'correct' : isSelected ? 'wrong' : 'default'
+                    }
 
                     return (
                       <AnswerButton
                         key={key}
                         label={key as OptionKey}
                         text={value}
-                        state={isSelected ? 'selected' : 'default'}
+                        state={state}
                         onClick={() => handleAnswer(key)}
                         disabled={isDisabled}
                       />
@@ -1137,7 +1304,7 @@ export function MockExam() {
                 )}
               </div>
 
-              {currentType === 'multi' && (() => {
+              {currentType === 'multi' && !currentRevealed && (() => {
                 const requiredCount = Array.isArray(currentQuestion.answer) ? currentQuestion.answer.length : MAX_MULTI_ANSWER
                 return (
                   <div className="mb-3 text-xs md:text-sm text-text-muted">
@@ -1152,7 +1319,7 @@ export function MockExam() {
                 )
               })()}
 
-              {currentType === 'matching' && (() => {
+              {currentType === 'matching' && !currentRevealed && (() => {
                 const leftCount = (Object.keys(currentQuestion.options) as OptionKey[]).filter(k => currentQuestion.options[k]).length
                 const selectedCount = Array.isArray(currentState?.userAnswer) ? currentState.userAnswer.length : 0
                 return (
@@ -1165,6 +1332,49 @@ export function MockExam() {
                   </div>
                 )
               })()}
+
+              {/* Practice mode: single-answer questions grade on click; the other
+                  types need an explicit check once the answer is complete. */}
+              {isPractice && !currentRevealed && currentType !== 'single' && (
+                <>
+                  {checkWarning && (
+                    <Alert tone="warning" role="alert" className="mb-3 text-sm">
+                      {currentType === 'multi'
+                        ? `Select ${Array.isArray(currentQuestion.answer) ? currentQuestion.answer.length : MAX_MULTI_ANSWER} answers to check.`
+                        : currentType === 'matching'
+                          ? 'Match every item to check your answer.'
+                          : 'Reorder the steps to set your answer before checking.'}
+                    </Alert>
+                  )}
+                  <Button onClick={revealCurrent} variant="primary" fullWidth className="mb-4">
+                    Check answer
+                  </Button>
+                </>
+              )}
+
+              {currentRevealed && (
+                <Alert tone={currentCorrect ? 'success' : 'danger'} role="status" className="mb-4 p-4 animate-enter">
+                  <div className={`font-semibold mb-2 flex items-center gap-2 text-sm md:text-base ${currentCorrect ? 'text-success' : 'text-danger'}`}>
+                    {currentCorrect ? <Check className="w-4 h-4 md:w-5 md:h-5" aria-hidden="true" /> : <X className="w-4 h-4 md:w-5 md:h-5" aria-hidden="true" />}
+                    <p>{currentCorrect ? 'Correct!' : 'Incorrect'}</p>
+                  </div>
+                  {!currentCorrect && (currentType === 'single' || currentType === 'multi') && (
+                    <p className="mb-2 text-xs md:text-sm text-success font-medium">
+                      Correct answer: {Array.isArray(currentQuestion.answer) ? currentQuestion.answer.join(', ') : currentQuestion.answer}
+                    </p>
+                  )}
+                  {currentQuestion.explanation && (
+                    <div className="border-t border-text-muted/20 pt-3 mt-3">
+                      <p className="text-text-muted text-xs md:text-sm font-medium mb-1">Explanation:</p>
+                      <div className="text-text-muted text-xs md:text-sm space-y-2 leading-relaxed">
+                        {currentQuestion.explanation.split('\n').filter(Boolean).map((para, i) => (
+                          <p key={i}>{para}</p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </Alert>
+              )}
 
               <button
                 onClick={toggleFlag}
@@ -1192,7 +1402,7 @@ export function MockExam() {
               </Button>
               {currentIndex === questions.length - 1 ? (
                 <Button onClick={() => setShowEndModal(true)} variant="primary" className="flex-1">
-                  Submit exam
+                  {isPractice ? 'Finish practice' : 'Submit exam'}
                 </Button>
               ) : (
                 <Button onClick={nextQuestion} variant="secondary" className="flex-1" arrow>
@@ -1214,7 +1424,14 @@ export function MockExam() {
               />
               {/* Legend: the grid's colors were previously unexplained. */}
               <ul className="mt-4 pt-3 border-t border-border-hairline/60 grid grid-cols-2 gap-x-3 gap-y-1.5 text-[11px] text-text-muted list-none p-0 m-0">
-                <li className="flex items-center gap-1.5"><span className="h-3 w-3 flex-shrink-0 rounded-sm bg-brand/30" aria-hidden="true" /> Answered</li>
+                {isPractice ? (
+                  <>
+                    <li className="flex items-center gap-1.5"><span className="h-3 w-3 flex-shrink-0 rounded-sm bg-success/30" aria-hidden="true" /> Correct</li>
+                    <li className="flex items-center gap-1.5"><span className="h-3 w-3 flex-shrink-0 rounded-sm bg-danger/25" aria-hidden="true" /> Incorrect</li>
+                  </>
+                ) : (
+                  <li className="flex items-center gap-1.5"><span className="h-3 w-3 flex-shrink-0 rounded-sm bg-brand/30" aria-hidden="true" /> Answered</li>
+                )}
                 <li className="flex items-center gap-1.5"><span className="h-3 w-3 flex-shrink-0 rounded-sm bg-bg-dark border border-border-hairline" aria-hidden="true" /> Unanswered</li>
                 <li className="flex items-center gap-1.5"><span className="h-3 w-3 flex-shrink-0 rounded-sm ring-2 ring-inset ring-brand" aria-hidden="true" /> Current</li>
                 <li className="flex items-center gap-1.5"><Flag className="h-3 w-3 flex-shrink-0 text-warning fill-warning" aria-hidden="true" /> Flagged</li>
@@ -1246,26 +1463,26 @@ export function MockExam() {
             unanswered counts + the unanswered warning before the irreversible
             "Submit for grading". (Replaces the removed review screen, whose job
             the question sidebar/modal navigator already covered.) */}
-        <Modal isOpen={showEndModal} title="Ready to submit?" onClose={() => setShowEndModal(false)}>
+        <Modal isOpen={showEndModal} title={isPractice ? 'Finish practice?' : 'Ready to submit?'} onClose={() => setShowEndModal(false)}>
           <div className="space-y-4">
-            <p className="text-text-primary">You have answered <span className="font-bold">{answeredCount}</span> of {questions.length} questions.</p>
+            <p className="text-text-primary">You have answered <span className="font-bold">{doneCount}</span> of {questions.length} questions.</p>
             <p className="text-text-primary"><span className="font-bold">{flaggedCount}</span> {flaggedCount === 1 ? 'question is' : 'questions are'} flagged for review.</p>
-            {answeredCount < questions.length && (
+            {doneCount < questions.length && (
               <p className="text-warning text-sm" role="alert">
-                <span className="font-semibold">{questions.length - answeredCount} unanswered</span> {questions.length - answeredCount === 1 ? 'question is' : 'questions are'} marked incorrect on submit.
+                <span className="font-semibold">{questions.length - doneCount} unanswered</span> {questions.length - doneCount === 1 ? 'question is' : 'questions are'} marked incorrect on submit.
               </p>
             )}
             {loading ? (
               <div className="py-8">
-                <LoadingSpinner text="Submitting exam..." />
+                <LoadingSpinner text={isPractice ? 'Finishing...' : 'Submitting exam...'} />
               </div>
             ) : (
               <div className="flex gap-4 mt-6">
                 <Button onClick={() => setShowEndModal(false)} variant="secondary" className="flex-1">
-                  Keep reviewing
+                  {isPractice ? 'Keep practicing' : 'Keep reviewing'}
                 </Button>
                 <Button onClick={handleSubmitExam} variant="primary" className="flex-1">
-                  Submit for grading
+                  {isPractice ? 'See results' : 'Submit for grading'}
                 </Button>
               </div>
             )}
@@ -1279,18 +1496,20 @@ export function MockExam() {
             (mirrors the practice leave-modal, which has always done this). */}
         <Modal
           isOpen={pendingLeaveUrl !== null}
-          title={pendingLeaveUrl === SIGN_OUT_SENTINEL ? 'Sign out?' : 'Leave the exam?'}
+          title={pendingLeaveUrl === SIGN_OUT_SENTINEL ? 'Sign out?' : isPractice ? 'Leave practice?' : 'Leave the exam?'}
           onClose={() => setPendingLeaveUrl(null)}
         >
           <div className="space-y-4">
             <p className="text-text-primary">
-              {pendingLeaveUrl === SIGN_OUT_SENTINEL
-                ? 'Your exam is still in progress. If you sign out now, your current answers and timer will be lost and this attempt will not be saved.'
-                : 'Your exam is still in progress. If you leave this page now, your current answers and timer will be lost and this attempt will not be saved.'}
+              {isPractice
+                ? `Your practice session is still in progress. If you ${pendingLeaveUrl === SIGN_OUT_SENTINEL ? 'sign out' : 'leave this page'} now, the answers from this session will not be saved.`
+                : pendingLeaveUrl === SIGN_OUT_SENTINEL
+                  ? 'Your exam is still in progress. If you sign out now, your current answers and timer will be lost and this attempt will not be saved.'
+                  : 'Your exam is still in progress. If you leave this page now, your current answers and timer will be lost and this attempt will not be saved.'}
             </p>
             <div className="flex gap-4 mt-6">
               <Button onClick={() => setPendingLeaveUrl(null)} variant="secondary" className="flex-1">
-                Stay in exam
+                {isPractice ? 'Keep practicing' : 'Stay in exam'}
               </Button>
               <Button
                 onClick={() => {
@@ -1307,7 +1526,7 @@ export function MockExam() {
                 variant="danger"
                 className="flex-1"
               >
-                {pendingLeaveUrl === SIGN_OUT_SENTINEL ? 'Sign out' : 'Leave exam'}
+                {pendingLeaveUrl === SIGN_OUT_SENTINEL ? 'Sign out' : isPractice ? 'Leave practice' : 'Leave exam'}
               </Button>
             </div>
           </div>
@@ -1323,8 +1542,9 @@ export function MockExam() {
         >
           <div className="space-y-4">
             <p className="text-text-primary">
-              This link opens in a new tab. Your exam keeps running here and
-              the timer does not pause.
+              {isPractice
+                ? 'This link opens in a new tab. Your practice session stays open here.'
+                : 'This link opens in a new tab. Your exam keeps running here and the timer does not pause.'}
             </p>
             <div className="flex gap-4 mt-6">
               <Button onClick={() => setPendingExternalUrl(null)} variant="secondary" className="flex-1">

@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import { ChevronDown, FileText, Target, Gauge } from 'lucide-react'
+import { ChevronDown, FileText, Target, Gauge, BookOpen } from 'lucide-react'
 import { getSortedCerts } from '../data/certifications'
 import { useExamActive } from '../hooks/useExamActive'
 import type { Certification } from '../data/certifications'
@@ -29,6 +29,7 @@ import type { Certification } from '../data/certifications'
 
 const PRACTICE_MODES = [
   { seg: 'practice-exam', label: 'Practice exam', desc: 'Full-length, timed, scored', Icon: FileText },
+  { seg: 'practice-exam?mode=practice', label: 'Practice mode', desc: 'Full-length, answers shown instantly', Icon: BookOpen },
   { seg: 'domain-practice', label: 'Domain practice', desc: 'One domain at a time', Icon: Target },
 ] as const
 
